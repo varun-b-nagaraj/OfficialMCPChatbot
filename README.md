@@ -34,16 +34,35 @@ vercel dev
 
 ```json
 {
+  "firstConvo": true,
+  "new_convo": true,
+  "catalogData": null,
+  "product_info": null,
+  "message_history": [],
   "messages": [
     { "role": "user", "content": "I need a running shoe under $120" }
   ]
 }
 ```
 
+`firstConvo` behavior:
+- If `true` and `catalogData` is not provided, backend fetches all products using MCP product tool and emits a `catalog` event with structured JSON.
+- Return payload includes `catalogData` in the `done` event.
+
+Subsequent calls:
+- Send back the same `catalogData` from first response.
+- You can also send it as `product_info` (frontend alias supported).
+- You can send prior turns as `message_history` (with optional `order` field).
+- Backend injects this catalog JSON into prompt context and avoids product-list tools by default.
+- It still uses other tools (for example order creation/customer/order lookup).
+
 ### Response
 
 `text/event-stream` with events:
 - `meta`: model + discovered tool names
+- `catalog_fetch`: status updates for first-conversation catalog preload
+- `catalog_page`: paged fetch progress while loading all products
+- `catalog`: structured product catalog JSON payload
 - `assistant`: assistant response for the current round
 - `tool_call`: tool invocation payload
 - `tool_result`: tool output text

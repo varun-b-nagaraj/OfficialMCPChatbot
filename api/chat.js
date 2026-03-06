@@ -43,11 +43,14 @@ const SALES_SYSTEM_PROMPT = [
   "3) Ask clarifying questions only when truly necessary to complete a task. Keep to at most one short clarifying question.",
   "4) Recommend strong alternatives and relevant add-ons when helpful.",
   "5) Use relevant sales context (for example popular products or order history patterns) to guide recommendations and encourage buying decisions.",
-  "6) Be honest about what you know; use tools for product/order/customer lookups or order creation.",
-  "7) When creating an order, confirm critical fields before finalizing.",
+  "6) Treat CATALOG_CONTEXT_JSON as the primary source of truth for products and pricing when present.",
+  "7) Do not call product listing/search tools when CATALOG_CONTEXT_JSON is available unless the user asks to refresh inventory or catalog data is clearly insufficient.",
+  "8) Be honest about what you know; use tools for order/customer lookup and order creation when needed.",
+  "9) When creating an order, confirm critical fields before finalizing.",
   "Behavior:",
   "- Default to action over questions. Do not interrogate the shopper.",
-  "- For generic shopping intents, call product tools first and present a curated list immediately.",
+  "- For generic shopping intents, use available catalog context first and present a curated list immediately.",
+  "- If message history exists, continue naturally from that context without re-asking already answered questions.",
   "- Keep answers concise, useful, and conversion-focused.",
   "- Summarize tool findings clearly and propose the next best step.",
   "- Use friendly sales language and concrete recommendations.",
@@ -59,6 +62,212 @@ const SALES_SYSTEM_PROMPT = [
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
   res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function isProductTool(tool) {
+  const name = String(tool?.name || "").toLowerCase();
+  const desc = String(tool?.description || "").toLowerCase();
+  if (name.includes("find_product") || name.includes("product_search") || name.includes("catalog_search")) {
+    return true;
+  }
+  if (name.includes("create_order") || name.includes("find_order") || name.includes("find_customer")) {
+    return false;
+  }
+  return (
+    (name.includes("product") && (name.includes("find") || name.includes("search") || name.includes("list"))) ||
+    desc.includes("search products") ||
+    desc.includes("find product") ||
+    desc.includes("list products")
+  );
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function parseJsonText(text) {
+  if (typeof text !== "string") return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Continue to best-effort extraction below.
+  }
+
+  const objectMatch = trimmed.match(/\{[\s\S]*\}/);
+  if (objectMatch) {
+    try {
+      return JSON.parse(objectMatch[0]);
+    } catch {
+      // No-op.
+    }
+  }
+
+  const arrayMatch = trimmed.match(/\[[\s\S]*\]/);
+  if (arrayMatch) {
+    try {
+      return JSON.parse(arrayMatch[0]);
+    } catch {
+      // No-op.
+    }
+  }
+
+  return null;
+}
+
+function extractStructuredResult(result) {
+  if (!result) return null;
+  if (result.structuredContent && typeof result.structuredContent === "object") {
+    return result.structuredContent;
+  }
+  if (result.data && typeof result.data === "object") {
+    return result.data;
+  }
+  if (typeof result === "object" && !Array.isArray(result) && result.content == null) {
+    return result;
+  }
+  if (!Array.isArray(result.content)) return null;
+
+  for (const part of result.content) {
+    if (!part) continue;
+    if (part.type === "json" && part.json && typeof part.json === "object") {
+      return part.json;
+    }
+    if (part.type === "text") {
+      const parsed = parseJsonText(part.text || "");
+      if (parsed && typeof parsed === "object") return parsed;
+    }
+  }
+
+  return null;
+}
+
+function extractProductsFromData(data) {
+  if (!data) return [];
+  if (Array.isArray(data)) return data;
+  const candidates = [
+    data.products,
+    data.items,
+    data.results,
+    data.data,
+    data.catalog,
+    data.rows
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) return candidate;
+  }
+
+  return [];
+}
+
+function buildPagedToolArgs(tool, offset, limit) {
+  const schema = tool?.inputSchema || {};
+  const props = schema.properties || {};
+  const args = {};
+
+  if ("offset" in props) args.offset = offset;
+  if ("skip" in props) args.skip = offset;
+  if ("limit" in props) args.limit = limit;
+  if ("page_size" in props) args.page_size = limit;
+  if ("per_page" in props) args.per_page = limit;
+  if ("page" in props) args.page = Math.floor(offset / limit) + 1;
+  if ("query" in props) args.query = "";
+  if ("keyword" in props) args.keyword = "";
+  if ("search" in props) args.search = "";
+  if ("enabled" in props) args.enabled = true;
+
+  return args;
+}
+
+function hasPagingInputs(tool) {
+  const props = tool?.inputSchema?.properties || {};
+  return (
+    "offset" in props ||
+    "skip" in props ||
+    "limit" in props ||
+    "page_size" in props ||
+    "per_page" in props ||
+    "page" in props
+  );
+}
+
+async function preloadCatalogData(config, mcpTools, res) {
+  const productTool = mcpTools.find((tool) => isProductTool(tool));
+  if (!productTool) {
+    throw new Error("No product listing tool found on MCP server.");
+  }
+
+  const limit = 100;
+  const maxPages = 50;
+  const supportsPaging = hasPagingInputs(productTool);
+  const seen = new Set();
+  const products = [];
+
+  for (let page = 0; page < maxPages; page += 1) {
+    const offset = page * limit;
+    const args = buildPagedToolArgs(productTool, offset, limit);
+    const raw = await callMcpTool(config, productTool.name, args);
+    const structured = extractStructuredResult(raw);
+    const batch = extractProductsFromData(structured);
+
+    for (const item of toArray(batch)) {
+      const id = item?.id ?? item?.productId ?? item?.product_id ?? null;
+      const key = id != null ? String(id) : JSON.stringify(item);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      products.push(item);
+    }
+
+    writeSse(res, "catalog_page", {
+      tool: productTool.name,
+      page: page + 1,
+      fetched: toArray(batch).length,
+      total: products.length
+    });
+
+    if (!supportsPaging) break;
+    if (toArray(batch).length < limit) break;
+  }
+
+  return {
+    sourceTool: productTool.name,
+    fetchedAt: new Date().toISOString(),
+    totalProducts: products.length,
+    products
+  };
+}
+
+function normalizeCatalogData(raw) {
+  if (!raw) return null;
+
+  let parsed = raw;
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object") return null;
+  const products = toArray(parsed.products).slice(0, 5000);
+  const resultProducts = toArray(parsed.results).slice(0, 5000);
+  const catalogProducts = products.length ? products : resultProducts;
+
+  return {
+    sourceTool: parsed.sourceTool || parsed?.execution?.toolName || "client_payload",
+    fetchedAt: parsed.fetchedAt || null,
+    totalProducts: Number(parsed.totalProducts || catalogProducts.length || 0),
+    products: catalogProducts,
+    meta: {
+      feedbackUrl: parsed.feedbackUrl || null,
+      execution: parsed.execution || null,
+      isPreview: parsed.isPreview ?? null,
+      generatedJqFilter: parsed.generatedJqFilter || null
+    }
+  };
 }
 
 function toOllamaTools(mcpTools) {
@@ -85,6 +294,35 @@ function sanitizeIncomingMessages(rawMessages) {
       content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "")
     }))
     .slice(-30);
+}
+
+function sortByOrder(messages) {
+  const withOrder = [];
+  const withoutOrder = [];
+
+  for (const msg of toArray(messages)) {
+    const order = Number(msg?.order);
+    if (Number.isFinite(order)) {
+      withOrder.push({ msg, order });
+    } else {
+      withoutOrder.push(msg);
+    }
+  }
+
+  withOrder.sort((a, b) => a.order - b.order);
+  return [...withOrder.map((x) => x.msg), ...withoutOrder];
+}
+
+function buildIncomingConversation(body) {
+  const history = sortByOrder(body.message_history);
+  const latest = sortByOrder(body.messages);
+  return sanitizeIncomingMessages([...history, ...latest]);
+}
+
+function pickFirstConvoFlag(body) {
+  if (typeof body.firstConvo === "boolean") return body.firstConvo;
+  if (typeof body.new_convo === "boolean") return body.new_convo;
+  return false;
 }
 
 export default async function handler(req, res) {
@@ -116,7 +354,9 @@ export default async function handler(req, res) {
   try {
     const config = getConfig();
     const body = typeof req.body === "string" ? JSON.parse(req.body || "{}") : req.body || {};
-    const incomingMessages = sanitizeIncomingMessages(body.messages);
+    const incomingMessages = buildIncomingConversation(body);
+    const firstConvo = pickFirstConvoFlag(body);
+    const providedCatalog = normalizeCatalogData(body.catalogData || body.product_info || body.products);
 
     if (incomingMessages.length === 0) {
       writeSse(res, "error", { message: "Request must include messages[]." });
@@ -126,16 +366,42 @@ export default async function handler(req, res) {
     }
 
     const mcpTools = await listMcpTools(config);
-    const ollamaTools = toOllamaTools(mcpTools);
+    let effectiveCatalog = providedCatalog;
+    if (firstConvo && !effectiveCatalog) {
+      writeSse(res, "catalog_fetch", { status: "started" });
+      effectiveCatalog = await preloadCatalogData(config, mcpTools, res);
+      writeSse(res, "catalog_fetch", {
+        status: "completed",
+        totalProducts: effectiveCatalog.totalProducts
+      });
+      writeSse(res, "catalog", effectiveCatalog);
+    }
+
+    const allowProductTool =
+      !effectiveCatalog ||
+      body.allowProductLookup === true ||
+      body.allow_product_lookup === true;
+    const activeTools = allowProductTool ? mcpTools : mcpTools.filter((tool) => !isProductTool(tool));
+    const ollamaTools = toOllamaTools(activeTools);
 
     const conversation = [
       { role: "system", content: SALES_SYSTEM_PROMPT },
+      ...(effectiveCatalog
+        ? [
+            {
+              role: "system",
+              content: `CATALOG_CONTEXT_JSON:\n${JSON.stringify(effectiveCatalog)}`
+            }
+          ]
+        : []),
       ...incomingMessages
     ];
 
     writeSse(res, "meta", {
       model: config.ollamaModel,
-      tools: mcpTools.map((t) => t.name)
+      tools: activeTools.map((t) => t.name),
+      usedCatalogPayload: Boolean(effectiveCatalog),
+      firstConvo
     });
 
     let finalText = "";
@@ -200,7 +466,8 @@ export default async function handler(req, res) {
 
     writeSse(res, "done", {
       ok: true,
-      message: finalText
+      message: finalText,
+      ...(firstConvo && effectiveCatalog ? { catalogData: effectiveCatalog } : {})
     });
     res.end();
   } catch (error) {
