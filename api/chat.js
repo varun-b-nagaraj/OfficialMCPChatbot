@@ -176,7 +176,59 @@ function buildPagedToolArgs(tool, offset, limit) {
   if ("query" in props) args.query = "";
   if ("keyword" in props) args.keyword = "";
   if ("search" in props) args.search = "";
-  if ("enabled" in props) args.enabled = true;
+  if ("instructions" in props) {
+    args.instructions = "List enabled products for shopping assistant catalog preload.";
+  }
+  if ("enabled" in props) {
+    const enabledType = props.enabled?.type;
+    args.enabled = enabledType === "string" ? "true" : true;
+  }
+
+  return coerceToolArguments(tool, args);
+}
+
+function coerceToolArguments(tool, rawArgs) {
+  const schema = tool?.inputSchema || {};
+  const props = schema.properties || {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const args = { ...(rawArgs || {}) };
+
+  for (const [name, definition] of Object.entries(props)) {
+    const expectedType = definition?.type;
+    const value = args[name];
+
+    if (value == null) {
+      if (required.has(name) && expectedType === "string") {
+        if (name === "instructions") {
+          args[name] = "Help shopper find matching products.";
+        } else {
+          args[name] = "";
+        }
+      }
+      continue;
+    }
+
+    if (expectedType === "string" && typeof value !== "string") {
+      if (typeof value === "boolean") args[name] = value ? "true" : "false";
+      else if (typeof value === "number") args[name] = String(value);
+      else args[name] = JSON.stringify(value);
+      continue;
+    }
+
+    if (expectedType === "boolean" && typeof value !== "boolean") {
+      if (typeof value === "string") {
+        args[name] = value.toLowerCase() === "true";
+      } else {
+        args[name] = Boolean(value);
+      }
+      continue;
+    }
+
+    if ((expectedType === "number" || expectedType === "integer") && typeof value !== "number") {
+      const num = Number(value);
+      if (!Number.isNaN(num)) args[name] = num;
+    }
+  }
 
   return args;
 }
@@ -282,6 +334,10 @@ function toOllamaTools(mcpTools) {
       }
     }
   }));
+}
+
+function getToolByName(tools, name) {
+  return toArray(tools).find((tool) => tool?.name === name) || null;
 }
 
 function sanitizeIncomingMessages(rawMessages) {
@@ -436,11 +492,13 @@ export default async function handler(req, res) {
       }
 
       for (const call of toolCalls) {
-        writeSse(res, "tool_call", { name: call.name, arguments: call.arguments });
+        const toolDef = getToolByName(activeTools, call.name);
+        const safeArgs = coerceToolArguments(toolDef, call.arguments || {});
+        writeSse(res, "tool_call", { name: call.name, arguments: safeArgs });
 
         let toolResult;
         try {
-          toolResult = await callMcpTool(config, call.name, call.arguments);
+          toolResult = await callMcpTool(config, call.name, safeArgs);
         } catch (error) {
           toolResult = {
             content: [{ type: "text", text: `Tool error: ${error.message}` }],
