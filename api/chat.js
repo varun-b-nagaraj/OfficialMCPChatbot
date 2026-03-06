@@ -381,6 +381,142 @@ function pickFirstConvoFlag(body) {
   return false;
 }
 
+function getLatestUserMessage(messages) {
+  const list = toArray(messages);
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const msg = list[i];
+    if (msg?.role === "user" && typeof msg.content === "string" && msg.content.trim()) {
+      return msg.content.trim();
+    }
+  }
+  return "";
+}
+
+function normalizeCatalogProducts(catalog) {
+  const products = toArray(catalog?.products);
+  return products
+    .map((p) => {
+      const name = String(p?.name || p?.title || "").trim();
+      const enabled = p?.enabled !== false;
+      const priceRaw = p?.price ?? p?.defaultDisplayedPrice ?? p?.defaultPrice ?? null;
+      const price = priceRaw == null ? null : Number(priceRaw);
+      return {
+        name,
+        enabled,
+        price: Number.isFinite(price) ? price : null,
+        sku: p?.sku || p?.id || null
+      };
+    })
+    .filter((p) => p.name && p.enabled);
+}
+
+function normalizeName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseMaxPrice(text) {
+  const match = String(text || "").toLowerCase().match(/(?:under|below|less than|<=?)\s*\$?\s*(\d+(?:\.\d+)?)/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : null;
+}
+
+function parseCategoryTerms(text) {
+  const stop = new Set([
+    "show", "me", "some", "products", "product", "find", "list", "recommend", "give", "enabled",
+    "under", "below", "less", "than", "price", "for", "with", "and", "or", "the", "a", "an"
+  ]);
+  return normalizeName(text)
+    .split(" ")
+    .filter((t) => t && !stop.has(t) && Number.isNaN(Number(t)));
+}
+
+function isShoppingBrowseIntent(text) {
+  const t = String(text || "").toLowerCase();
+  return /(show|find|list|recommend|suggest|shop|what.*have|products?)/.test(t);
+}
+
+function formatCatalogRecommendation(userText, catalogProducts) {
+  const maxPrice = parseMaxPrice(userText);
+  const terms = parseCategoryTerms(userText);
+  let filtered = catalogProducts.slice();
+
+  if (maxPrice != null) {
+    filtered = filtered.filter((p) => p.price == null || p.price <= maxPrice);
+  }
+
+  if (terms.length) {
+    filtered = filtered.filter((p) => {
+      const name = normalizeName(p.name);
+      return terms.some((term) => name.includes(term));
+    });
+  }
+
+  if (!filtered.length) {
+    filtered = catalogProducts
+      .filter((p) => (maxPrice == null ? true : p.price == null || p.price <= maxPrice))
+      .slice(0, 5);
+  }
+
+  const picks = filtered.slice(0, 5);
+  if (!picks.length) {
+    return "I could not find matching enabled products right now. Tell me a category and budget and I will narrow it down fast.";
+  }
+
+  const header = maxPrice != null
+    ? `Here are enabled picks${terms.length ? ` for ${terms.join(", ")}` : ""} under $${maxPrice}:`
+    : `Here are enabled picks${terms.length ? ` for ${terms.join(", ")}` : ""}:`;
+  const lines = [header];
+  for (const p of picks) {
+    const priceText = p.price == null ? "Price available in checkout" : `$${p.price.toFixed(2)}`;
+    lines.push(`- ${p.name} - ${priceText}`);
+  }
+  lines.push("Tell me which one you want and I can help with checkout.");
+  return lines.join("\n");
+}
+
+function extractListedNames(text) {
+  const lines = String(text || "").split("\n");
+  const names = [];
+  for (const lineRaw of lines) {
+    const line = lineRaw.trim();
+    if (!line) continue;
+    if (!/^[-*•\d]/.test(line)) continue;
+    const noBullet = line.replace(/^[-*•\d\.\)\s]+/, "");
+    const name = noBullet.split(/\s-\s|\s–\s|\s\|\s|\s\$/)[0]?.trim();
+    if (name && name.length > 1) names.push(name);
+  }
+  return names;
+}
+
+function hasCatalogHallucination(text, catalogProducts) {
+  const catalogNames = new Set(catalogProducts.map((p) => normalizeName(p.name)));
+  if (!catalogNames.size) return false;
+  const listed = extractListedNames(text);
+  if (!listed.length) return false;
+
+  for (const name of listed) {
+    const normalized = normalizeName(name);
+    if (!normalized) continue;
+    const exact = catalogNames.has(normalized);
+    const partial = [...catalogNames].some((c) => c.includes(normalized) || normalized.includes(c));
+    if (!exact && !partial) return true;
+  }
+
+  return false;
+}
+
+function streamTextAsDeltas(res, text, round) {
+  const chunks = String(text || "").match(/\S+\s*|\n/g) || [];
+  for (const chunk of chunks) {
+    writeSse(res, "assistant_delta", { token: chunk, round });
+  }
+}
+
 export default async function handler(req, res) {
   const originAllowed = applyCors(req, res);
 
@@ -452,6 +588,8 @@ export default async function handler(req, res) {
         : []),
       ...incomingMessages
     ];
+    const latestUserText = getLatestUserMessage(incomingMessages);
+    const catalogProducts = normalizeCatalogProducts(effectiveCatalog);
 
     writeSse(res, "meta", {
       model: config.ollamaModel,
@@ -459,6 +597,19 @@ export default async function handler(req, res) {
       usedCatalogPayload: Boolean(effectiveCatalog),
       firstConvo
     });
+
+    if (effectiveCatalog && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
+      const deterministic = formatCatalogRecommendation(latestUserText, catalogProducts);
+      streamTextAsDeltas(res, deterministic, 1);
+      writeSse(res, "assistant", { text: deterministic, round: 1 });
+      writeSse(res, "done", {
+        ok: true,
+        message: deterministic,
+        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+      });
+      res.end();
+      return;
+    }
 
     let finalText = "";
 
@@ -468,15 +619,16 @@ export default async function handler(req, res) {
         model: config.ollamaModel,
         apiKey: config.ollamaApiKey,
         messages: conversation,
-        tools: ollamaTools,
-        onToken: (token) => {
-          writeSse(res, "assistant_delta", { token, round: round + 1 });
-        }
+        tools: ollamaTools
       });
 
       const assistantMessage = modelResponse?.message || { role: "assistant", content: "" };
-      const assistantText = assistantMessage.content || "";
+      let assistantText = assistantMessage.content || "";
       const toolCalls = normalizeToolCalls(assistantMessage);
+
+      if (effectiveCatalog && !allowProductTool && hasCatalogHallucination(assistantText, catalogProducts)) {
+        assistantText = formatCatalogRecommendation(latestUserText || assistantText, catalogProducts);
+      }
 
       conversation.push({
         role: "assistant",
@@ -486,6 +638,7 @@ export default async function handler(req, res) {
 
       if (assistantText) {
         finalText = assistantText;
+        streamTextAsDeltas(res, assistantText, round + 1);
         writeSse(res, "assistant", { text: assistantText, round: round + 1 });
       }
 
