@@ -22,6 +22,11 @@ function applyCors(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
+  // Allow non-browser/server-to-server requests with no Origin header.
+  if (!origin) {
+    return true;
+  }
+
   if (allowed.includes(origin)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     return true;
