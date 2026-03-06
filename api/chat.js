@@ -1,6 +1,6 @@
 import { getConfig } from "../lib/env.js";
 import { callMcpTool, listMcpTools, mcpResultToText } from "../lib/mcp-client.js";
-import { normalizeToolCalls, ollamaChat } from "../lib/ollama.js";
+import { normalizeToolCalls, ollamaChatStream } from "../lib/ollama.js";
 
 export const config = {
   runtime: "nodejs"
@@ -463,13 +463,15 @@ export default async function handler(req, res) {
     let finalText = "";
 
     for (let round = 0; round < config.maxToolRounds; round += 1) {
-      const modelResponse = await ollamaChat({
+      const modelResponse = await ollamaChatStream({
         baseUrl: config.ollamaBaseUrl,
         model: config.ollamaModel,
         apiKey: config.ollamaApiKey,
         messages: conversation,
         tools: ollamaTools,
-        stream: false
+        onToken: (token) => {
+          writeSse(res, "assistant_delta", { token, round: round + 1 });
+        }
       });
 
       const assistantMessage = modelResponse?.message || { role: "assistant", content: "" };
