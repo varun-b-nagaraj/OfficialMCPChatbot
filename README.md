@@ -15,6 +15,7 @@ Copy `.env.example` to `.env` and fill values:
 - `MCP_CONNECT_URL` (optional full URL including `?token=...`)
 - `MCP_SERVER_URL` (use `https://mcp.zapier.com/api/v1/connect` if not using `MCP_CONNECT_URL`)
 - `MCP_TOKEN` (your Zapier MCP token if not embedded in `MCP_CONNECT_URL`)
+- `CORS_ALLOW_ORIGINS` (comma-separated origins allowed to call `/api/chat` from browsers)
 
 ## 2) Install + Run
 

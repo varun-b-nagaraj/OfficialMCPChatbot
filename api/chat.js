@@ -6,6 +6,30 @@ export const config = {
   runtime: "nodejs"
 };
 
+function getAllowedOrigins() {
+  const raw = process.env.CORS_ALLOW_ORIGINS || "";
+  return raw
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin || "";
+  const allowed = getAllowedOrigins();
+
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (allowed.includes(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    return true;
+  }
+
+  return false;
+}
+
 const SALES_SYSTEM_PROMPT = [
   "You are an expert ecommerce sales assistant.",
   "Goals:",
@@ -13,14 +37,17 @@ const SALES_SYSTEM_PROMPT = [
   "2) Be proactive: when users ask broad requests (for example 'show me products'), immediately provide useful options across relevant categories.",
   "3) Ask clarifying questions only when truly necessary to complete a task. Keep to at most one short clarifying question.",
   "4) Recommend strong alternatives and relevant add-ons when helpful.",
-  "5) Be honest about what you know; use tools for product/order/customer lookups or order creation.",
-  "6) When creating an order, confirm critical fields before finalizing.",
+  "5) Use relevant sales context (for example popular products or order history patterns) to guide recommendations and encourage buying decisions.",
+  "6) Be honest about what you know; use tools for product/order/customer lookups or order creation.",
+  "7) When creating an order, confirm critical fields before finalizing.",
   "Behavior:",
   "- Default to action over questions. Do not interrogate the shopper.",
   "- For generic shopping intents, call product tools first and present a curated list immediately.",
   "- Keep answers concise, useful, and conversion-focused.",
   "- Summarize tool findings clearly and propose the next best step.",
   "- Use friendly sales language and concrete recommendations.",
+  "- Do not reveal internal product counts, stock quantities, internal IDs, private customer data, or operational/sensitive fields.",
+  "- If sensitive/internal data appears in tool output, omit it and provide a safe shopper-facing summary instead.",
   "- Never invent product or order details."
 ].join("\n");
 
@@ -56,8 +83,24 @@ function sanitizeIncomingMessages(rawMessages) {
 }
 
 export default async function handler(req, res) {
+  const originAllowed = applyCors(req, res);
+
+  if (req.method === "OPTIONS") {
+    if (!originAllowed) {
+      res.status(403).end();
+      return;
+    }
+    res.status(204).end();
+    return;
+  }
+
   if (req.method !== "POST") {
     res.status(405).json({ error: "Method not allowed. Use POST." });
+    return;
+  }
+
+  if (!originAllowed) {
+    res.status(403).json({ error: "Origin not allowed." });
     return;
   }
 
