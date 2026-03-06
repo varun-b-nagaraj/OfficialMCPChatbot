@@ -69,6 +69,44 @@ Subsequent calls:
 - `error`: error message
 - `done`: completion status
 
+`done` event can include:
+- `cart_actions`: array of client-side cart instructions (no server-side cart mutation)
+- `pending`: disambiguation payload when user must choose product/type first
+
+Example `cart_actions` item:
+
+```json
+{
+  "type": "cart.add",
+  "product": {
+    "id": 455570501,
+    "quantity": 2,
+    "options": {},
+    "sku": "0000077",
+    "name": "Pizza #2"
+  }
+}
+```
+
+Example frontend execution with Ecwid:
+
+```js
+function applyCartActions(actions) {
+  for (const action of actions || []) {
+    if (action.type === "cart.add" && action.product?.id) {
+      Ecwid.Cart.addProduct({
+        id: action.product.id,
+        quantity: action.product.quantity || 1,
+        options: action.product.options || {},
+        callback: function(success, product, cart, error) {
+          console.log("cart.add", { success, product, cart, error });
+        }
+      });
+    }
+  }
+}
+```
+
 ## 4) Frontend Consumption Example
 
 ```js

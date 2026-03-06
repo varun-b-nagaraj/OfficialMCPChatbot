@@ -47,6 +47,7 @@ const SALES_SYSTEM_PROMPT = [
   "7) Do not call product listing/search tools when CATALOG_CONTEXT_JSON is available unless the user asks to refresh inventory or catalog data is clearly insufficient.",
   "8) Be honest about what you know; use tools for order/customer lookup and order creation when needed.",
   "9) When creating an order, confirm critical fields before finalizing.",
+  "10) For cart operations, return structured cart action intent to the client layer and ask for product type/options when selection is ambiguous.",
   "Behavior:",
   "- Default to action over questions. Do not interrogate the shopper.",
   "- For generic shopping intents, use available catalog context first and present a curated list immediately.",
@@ -400,11 +401,18 @@ function normalizeCatalogProducts(catalog) {
       const enabled = p?.enabled !== false;
       const priceRaw = p?.price ?? p?.defaultDisplayedPrice ?? p?.defaultPrice ?? null;
       const price = priceRaw == null ? null : Number(priceRaw);
+      const idRaw = p?.id ?? p?.productId ?? p?.product_id ?? null;
+      const id = idRaw == null ? null : Number(idRaw);
+      const options = Array.isArray(p?.options) ? p.options : [];
+      const variants = Array.isArray(p?.variants) ? p.variants : [];
       return {
         name,
         enabled,
         price: Number.isFinite(price) ? price : null,
-        sku: p?.sku || p?.id || null
+        sku: p?.sku || p?.defaultSku || null,
+        id: Number.isFinite(id) ? id : null,
+        options,
+        variants
       };
     })
     .filter((p) => p.name && p.enabled);
@@ -517,6 +525,117 @@ function streamTextAsDeltas(res, text, round) {
   }
 }
 
+function looksLikeAddToCartIntent(text) {
+  const t = String(text || "").toLowerCase();
+  return /\b(add|put|place|throw|toss)\b/.test(t) && /\b(cart|bag)\b/.test(t);
+}
+
+function parseQuantity(text) {
+  const t = String(text || "").toLowerCase();
+  const match = t.match(/\b(\d{1,2})\s*(x|qty|quantity)?\b/);
+  if (!match) return 1;
+  const qty = Number(match[1]);
+  if (!Number.isFinite(qty)) return 1;
+  return Math.max(1, Math.min(20, qty));
+}
+
+function productMatchScore(userText, productName) {
+  const u = normalizeName(userText);
+  const p = normalizeName(productName);
+  if (!u || !p) return 0;
+  if (u.includes(p)) return 100 + p.length;
+  const ut = new Set(u.split(" ").filter(Boolean));
+  const pt = new Set(p.split(" ").filter(Boolean));
+  let overlap = 0;
+  for (const token of pt) {
+    if (ut.has(token)) overlap += 1;
+  }
+  return overlap;
+}
+
+function findCartCandidates(userText, catalogProducts) {
+  const scored = [];
+  for (const p of toArray(catalogProducts)) {
+    const score = productMatchScore(userText, p.name);
+    if (score > 0) scored.push({ product: p, score });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map((x) => x.product).slice(0, 5);
+}
+
+function getOptionNames(product) {
+  const names = [];
+  for (const opt of toArray(product?.options)) {
+    const n = opt?.name || opt?.title || opt?.optionName;
+    if (n) names.push(String(n));
+  }
+  return names;
+}
+
+function userSpecifiedOptionType(userText, product) {
+  const t = normalizeName(userText);
+  if (!t) return false;
+  for (const n of getOptionNames(product)) {
+    const normalized = normalizeName(n);
+    if (normalized && t.includes(normalized)) return true;
+  }
+  return false;
+}
+
+function ordinalIndex(text) {
+  const t = String(text || "").toLowerCase();
+  if (/\bfirst\b/.test(t)) return 0;
+  if (/\bsecond\b/.test(t)) return 1;
+  if (/\bthird\b/.test(t)) return 2;
+  if (/\bfourth\b/.test(t)) return 3;
+  if (/\blast\b/.test(t)) return -1;
+  const m = t.match(/\b(\d+)\b/);
+  if (m) {
+    const n = Number(m[1]) - 1;
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return null;
+}
+
+function resolvePendingSelection(pending, userText) {
+  if (!pending || pending.type !== "choose_for_cart" || !Array.isArray(pending.options)) return null;
+  if (!pending.options.length) return null;
+  const idx = ordinalIndex(userText);
+  if (idx == null) return null;
+  const chosen = idx === -1 ? pending.options[pending.options.length - 1] : pending.options[idx];
+  return chosen || null;
+}
+
+function buildCartAction(product, quantity) {
+  if (!product || !Number.isFinite(Number(product.id))) return null;
+  return {
+    type: "cart.add",
+    product: {
+      id: Number(product.id),
+      quantity,
+      options: {},
+      sku: product.sku || null,
+      name: product.name || null
+    }
+  };
+}
+
+function buildPendingFromCandidates(candidates, quantity, reason) {
+  return {
+    type: "choose_for_cart",
+    reason,
+    quantity,
+    options: candidates.map((p, i) => ({
+      index: i + 1,
+      id: p.id,
+      name: p.name,
+      sku: p.sku || null,
+      price: p.price,
+      optionTypes: getOptionNames(p)
+    }))
+  };
+}
+
 export default async function handler(req, res) {
   const originAllowed = applyCors(req, res);
 
@@ -590,6 +709,7 @@ export default async function handler(req, res) {
     ];
     const latestUserText = getLatestUserMessage(incomingMessages);
     const catalogProducts = normalizeCatalogProducts(effectiveCatalog);
+    const pendingInput = body.pending || null;
 
     writeSse(res, "meta", {
       model: config.ollamaModel,
@@ -598,6 +718,90 @@ export default async function handler(req, res) {
       firstConvo
     });
 
+    if (effectiveCatalog && looksLikeAddToCartIntent(latestUserText)) {
+      const quantity = parseQuantity(latestUserText);
+      const pendingChoice = resolvePendingSelection(pendingInput, latestUserText);
+      if (pendingChoice) {
+        const action = buildCartAction(pendingChoice, quantity);
+        if (action) {
+          const confirmation = `Added ${pendingChoice.name} to your cart.`;
+          streamTextAsDeltas(res, confirmation, 1);
+          writeSse(res, "assistant", { text: confirmation, round: 1 });
+          writeSse(res, "done", {
+            ok: true,
+            message: confirmation,
+            cart_actions: [action],
+            pending: null,
+            ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+          });
+          res.end();
+          return;
+        }
+      }
+
+      const candidates = findCartCandidates(latestUserText, catalogProducts);
+      if (!candidates.length) {
+        const noMatch = "I could not find that product in the enabled catalog. Tell me the product type or exact name.";
+        streamTextAsDeltas(res, noMatch, 1);
+        writeSse(res, "assistant", { text: noMatch, round: 1 });
+        writeSse(res, "done", {
+          ok: true,
+          message: noMatch,
+          cart_actions: [],
+          pending: null,
+          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+        });
+        res.end();
+        return;
+      }
+
+      const best = candidates[0];
+      const multiple = candidates.length > 1;
+      const requiresType = getOptionNames(best).length > 0 && !userSpecifiedOptionType(latestUserText, best);
+
+      if (multiple || requiresType || !Number.isFinite(Number(best.id))) {
+        const reason = requiresType
+          ? "Please choose the product type/options before adding to cart."
+          : "Please choose which product you want to add.";
+        const pending = buildPendingFromCandidates(candidates, quantity, reason);
+        const lines = [reason];
+        for (const option of pending.options.slice(0, 4)) {
+          const priceText = Number.isFinite(Number(option.price)) ? ` - $${Number(option.price).toFixed(2)}` : "";
+          const optionTypeText = option.optionTypes.length ? ` | types: ${option.optionTypes.join(", ")}` : "";
+          lines.push(`${option.index}. ${option.name}${priceText}${optionTypeText}`);
+        }
+        lines.push("Reply with the number (for example, 1 or 2).");
+        const prompt = lines.join("\n");
+        streamTextAsDeltas(res, prompt, 1);
+        writeSse(res, "assistant", { text: prompt, round: 1 });
+        writeSse(res, "done", {
+          ok: true,
+          message: prompt,
+          cart_actions: [],
+          pending,
+          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+        });
+        res.end();
+        return;
+      }
+
+      const action = buildCartAction(best, quantity);
+      if (action) {
+        const confirmation = `Added ${best.name} to your cart.`;
+        streamTextAsDeltas(res, confirmation, 1);
+        writeSse(res, "assistant", { text: confirmation, round: 1 });
+        writeSse(res, "done", {
+          ok: true,
+          message: confirmation,
+          cart_actions: [action],
+          pending: null,
+          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+        });
+        res.end();
+        return;
+      }
+    }
+
     if (effectiveCatalog && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
       const deterministic = formatCatalogRecommendation(latestUserText, catalogProducts);
       streamTextAsDeltas(res, deterministic, 1);
@@ -605,6 +809,8 @@ export default async function handler(req, res) {
       writeSse(res, "done", {
         ok: true,
         message: deterministic,
+        cart_actions: [],
+        pending: null,
         ...(firstConvo ? { catalogData: effectiveCatalog } : {})
       });
       res.end();
@@ -680,6 +886,8 @@ export default async function handler(req, res) {
     writeSse(res, "done", {
       ok: true,
       message: finalText,
+      cart_actions: [],
+      pending: null,
       ...(firstConvo && effectiveCatalog ? { catalogData: effectiveCatalog } : {})
     });
     res.end();
