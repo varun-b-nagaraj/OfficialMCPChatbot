@@ -73,6 +73,12 @@ Subsequent calls:
 - `cart_actions`: array of client-side cart instructions (no server-side cart mutation)
 - `pending`: disambiguation payload when user must choose product/type first
 
+Agent tooling includes local callable tool:
+- `add_to_cart_decision`
+  - Purpose: resolve add-to-cart intent into structured `cart_actions` / `pending`
+  - Inputs: `user_message`, `catalog_products`, optional `pending`, optional `message_history`
+  - Output: JSON with `message`, `cart_actions`, and `pending`
+
 Example `cart_actions` item:
 
 ```json

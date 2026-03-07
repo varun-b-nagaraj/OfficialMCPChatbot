@@ -48,6 +48,7 @@ const SALES_SYSTEM_PROMPT = [
   "8) Be honest about what you know; use tools for order/customer lookup and order creation when needed.",
   "9) When creating an order, confirm critical fields before finalizing.",
   "10) For cart operations, return structured cart action intent to the client layer and ask for product type/options when selection is ambiguous.",
+  "11) Never claim cart support is unavailable. Cart operations are supported through cart_actions and pending responses.",
   "Behavior:",
   "- Default to action over questions. Do not interrogate the shopper.",
   "- For generic shopping intents, use available catalog context first and present a curated list immediately.",
@@ -59,6 +60,7 @@ const SALES_SYSTEM_PROMPT = [
   "- If sensitive/internal data appears in tool output, omit it and provide a safe shopper-facing summary instead.",
   "- Never invent product or order details."
 ].join("\n");
+const LOCAL_CART_TOOL_NAME = "add_to_cart_decision";
 
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
@@ -563,6 +565,61 @@ function streamTextAsDeltas(res, text, round) {
   }
 }
 
+function isToolingQuestion(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    t.includes("what are all available tools") ||
+    t.includes("what tools") ||
+    t.includes("available tools") ||
+    t.includes("do you have") ||
+    t.includes("cart tool")
+  );
+}
+
+function toolingSummaryText(activeTools) {
+  const names = toArray(activeTools).map((t) => t?.name).filter(Boolean);
+  const lines = [
+    "Available capabilities:",
+    "- Product/catalog search tools",
+    "- Customer lookup tools",
+    "- Order search tools",
+    "- Order creation tools",
+    "- Cart decision layer via `cart_actions` and `pending` (frontend executes Ecwid.Cart methods)"
+  ];
+  if (names.length) {
+    lines.push("", "MCP tools currently connected:");
+    for (const n of names) lines.push(`- ${n}`);
+  }
+  lines.push("", "So yes: cart add/modify intent is supported through structured cart actions.");
+  return lines.join("\n");
+}
+
+function localCartToolDefinition() {
+  return {
+    type: "function",
+    function: {
+      name: LOCAL_CART_TOOL_NAME,
+      description:
+        "Resolve add-to-cart intent into structured cart_actions and pending chooser payload for frontend Ecwid.Cart execution.",
+      parameters: {
+        type: "object",
+        properties: {
+          user_message: { type: "string" },
+          catalog_products: {
+            type: "array",
+            items: { type: "object" }
+          },
+          pending: { type: "object" },
+          message_history: {
+            type: "array",
+            items: { type: "object" }
+          }
+        }
+      }
+    }
+  };
+}
+
 function looksLikeAddToCartIntent(text) {
   const t = String(text || "").toLowerCase();
   return /\b(add|put|place|throw|toss)\b/.test(t) && /\b(cart|bag)\b/.test(t);
@@ -674,6 +731,77 @@ function buildPendingFromCandidates(candidates, quantity, reason) {
   };
 }
 
+function resolveCartDecision(userText, catalogProducts, pendingInput) {
+  const quantity = parseQuantity(userText);
+  const pendingChoice = resolvePendingSelection(pendingInput, userText);
+  if (pendingChoice) {
+    const action = buildCartAction(pendingChoice, quantity);
+    if (action) {
+      return {
+        message: `Added ${pendingChoice.name} to your cart.`,
+        cart_actions: [action],
+        pending: null
+      };
+    }
+  }
+
+  const candidates = findCartCandidates(userText, catalogProducts);
+  if (!candidates.length) {
+    return {
+      message: "I could not find that product in the enabled catalog. Tell me the product type or exact name.",
+      cart_actions: [],
+      pending: null
+    };
+  }
+
+  const best = candidates[0];
+  const multiple = candidates.length > 1;
+  const requiresType = getOptionNames(best).length > 0 && !userSpecifiedOptionType(userText, best);
+
+  if (multiple || requiresType || !Number.isFinite(Number(best.id))) {
+    const reason = requiresType
+      ? "Please choose the product type/options before adding to cart."
+      : "Please choose which product you want to add.";
+    const pending = buildPendingFromCandidates(candidates, quantity, reason);
+    const lines = [reason];
+    for (const option of pending.options.slice(0, 4)) {
+      const priceText = Number.isFinite(Number(option.price)) ? ` - $${Number(option.price).toFixed(2)}` : "";
+      const optionTypeText = option.optionTypes.length ? ` | types: ${option.optionTypes.join(", ")}` : "";
+      lines.push(`${option.index}. ${option.name}${priceText}${optionTypeText}`);
+    }
+    lines.push("Reply with the number (for example, 1 or 2).");
+    return {
+      message: lines.join("\n"),
+      cart_actions: [],
+      pending
+    };
+  }
+
+  const action = buildCartAction(best, quantity);
+  if (!action) {
+    const pending = buildPendingFromCandidates([best], quantity, "Please confirm the exact product type.");
+    return {
+      message: "Please confirm the product type before I add it to cart.",
+      cart_actions: [],
+      pending
+    };
+  }
+
+  return {
+    message: `Added ${best.name} to your cart.`,
+    cart_actions: [action],
+    pending: null
+  };
+}
+
+function runLocalCartTool(args, fallbackUserText, catalogProducts, pendingInput) {
+  const userText = String(args?.user_message || fallbackUserText || "");
+  const pending = args?.pending && typeof args.pending === "object" ? args.pending : pendingInput;
+  const providedCatalog = Array.isArray(args?.catalog_products) ? args.catalog_products : catalogProducts;
+  const normalizedCatalog = normalizeCatalogProducts({ products: providedCatalog });
+  return resolveCartDecision(userText, normalizedCatalog, pending);
+}
+
 export default async function handler(req, res) {
   const originAllowed = applyCors(req, res);
 
@@ -731,7 +859,7 @@ export default async function handler(req, res) {
       body.allowProductLookup === true ||
       body.allow_product_lookup === true;
     const activeTools = allowProductTool ? mcpTools : mcpTools.filter((tool) => !isProductTool(tool));
-    const ollamaTools = toOllamaTools(activeTools);
+    const ollamaTools = [...toOllamaTools(activeTools), localCartToolDefinition()];
 
     const conversation = [
       { role: "system", content: SALES_SYSTEM_PROMPT },
@@ -756,88 +884,34 @@ export default async function handler(req, res) {
       firstConvo
     });
 
+    if (isToolingQuestion(latestUserText)) {
+      const text = toolingSummaryText(activeTools);
+      streamTextAsDeltas(res, text, 1);
+      writeSse(res, "assistant", { text, round: 1 });
+      writeSse(res, "done", {
+        ok: true,
+        message: text,
+        cart_actions: [],
+        pending: null,
+        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+      });
+      res.end();
+      return;
+    }
+
     if (effectiveCatalog && looksLikeAddToCartIntent(latestUserText)) {
-      const quantity = parseQuantity(latestUserText);
-      const pendingChoice = resolvePendingSelection(pendingInput, latestUserText);
-      if (pendingChoice) {
-        const action = buildCartAction(pendingChoice, quantity);
-        if (action) {
-          const confirmation = `Added ${pendingChoice.name} to your cart.`;
-          streamTextAsDeltas(res, confirmation, 1);
-          writeSse(res, "assistant", { text: confirmation, round: 1 });
-          writeSse(res, "done", {
-            ok: true,
-            message: confirmation,
-            cart_actions: [action],
-            pending: null,
-            ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-          });
-          res.end();
-          return;
-        }
-      }
-
-      const candidates = findCartCandidates(latestUserText, catalogProducts);
-      if (!candidates.length) {
-        const noMatch = "I could not find that product in the enabled catalog. Tell me the product type or exact name.";
-        streamTextAsDeltas(res, noMatch, 1);
-        writeSse(res, "assistant", { text: noMatch, round: 1 });
-        writeSse(res, "done", {
-          ok: true,
-          message: noMatch,
-          cart_actions: [],
-          pending: null,
-          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-        });
-        res.end();
-        return;
-      }
-
-      const best = candidates[0];
-      const multiple = candidates.length > 1;
-      const requiresType = getOptionNames(best).length > 0 && !userSpecifiedOptionType(latestUserText, best);
-
-      if (multiple || requiresType || !Number.isFinite(Number(best.id))) {
-        const reason = requiresType
-          ? "Please choose the product type/options before adding to cart."
-          : "Please choose which product you want to add.";
-        const pending = buildPendingFromCandidates(candidates, quantity, reason);
-        const lines = [reason];
-        for (const option of pending.options.slice(0, 4)) {
-          const priceText = Number.isFinite(Number(option.price)) ? ` - $${Number(option.price).toFixed(2)}` : "";
-          const optionTypeText = option.optionTypes.length ? ` | types: ${option.optionTypes.join(", ")}` : "";
-          lines.push(`${option.index}. ${option.name}${priceText}${optionTypeText}`);
-        }
-        lines.push("Reply with the number (for example, 1 or 2).");
-        const prompt = lines.join("\n");
-        streamTextAsDeltas(res, prompt, 1);
-        writeSse(res, "assistant", { text: prompt, round: 1 });
-        writeSse(res, "done", {
-          ok: true,
-          message: prompt,
-          cart_actions: [],
-          pending,
-          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-        });
-        res.end();
-        return;
-      }
-
-      const action = buildCartAction(best, quantity);
-      if (action) {
-        const confirmation = `Added ${best.name} to your cart.`;
-        streamTextAsDeltas(res, confirmation, 1);
-        writeSse(res, "assistant", { text: confirmation, round: 1 });
-        writeSse(res, "done", {
-          ok: true,
-          message: confirmation,
-          cart_actions: [action],
-          pending: null,
-          ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-        });
-        res.end();
-        return;
-      }
+      const decision = resolveCartDecision(latestUserText, catalogProducts, pendingInput);
+      streamTextAsDeltas(res, decision.message, 1);
+      writeSse(res, "assistant", { text: decision.message, round: 1 });
+      writeSse(res, "done", {
+        ok: true,
+        message: decision.message,
+        cart_actions: decision.cart_actions,
+        pending: decision.pending,
+        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+      });
+      res.end();
+      return;
     }
 
     if (effectiveCatalog && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
@@ -856,6 +930,8 @@ export default async function handler(req, res) {
     }
 
     let finalText = "";
+    let finalCartActions = [];
+    let finalPending = null;
 
     for (let round = 0; round < config.maxToolRounds; round += 1) {
       const modelResponse = await ollamaChatStream({
@@ -891,18 +967,38 @@ export default async function handler(req, res) {
       }
 
       for (const call of toolCalls) {
-        const toolDef = getToolByName(activeTools, call.name);
-        const safeArgs = coerceToolArguments(toolDef, call.arguments || {});
-        writeSse(res, "tool_call", { name: call.name, arguments: safeArgs });
-
         let toolResult;
-        try {
-          toolResult = await callMcpTool(config, call.name, safeArgs);
-        } catch (error) {
-          toolResult = {
-            content: [{ type: "text", text: `Tool error: ${error.message}` }],
-            isError: true
+        let safeArgs = call.arguments || {};
+        if (call.name === LOCAL_CART_TOOL_NAME) {
+          safeArgs = {
+            user_message: safeArgs.user_message || latestUserText,
+            catalog_products: Array.isArray(safeArgs.catalog_products) ? safeArgs.catalog_products : catalogProducts,
+            pending: safeArgs.pending || pendingInput,
+            message_history: safeArgs.message_history || body.message_history || []
           };
+          writeSse(res, "tool_call", { name: call.name, arguments: safeArgs });
+          const decision = runLocalCartTool(safeArgs, latestUserText, catalogProducts, pendingInput);
+          toolResult = {
+            content: [{ type: "text", text: JSON.stringify(decision) }],
+            structuredContent: decision
+          };
+          finalCartActions = Array.isArray(decision.cart_actions) ? decision.cart_actions : [];
+          finalPending = decision.pending || null;
+          if (decision.message) {
+            finalText = decision.message;
+          }
+        } else {
+          const toolDef = getToolByName(activeTools, call.name);
+          safeArgs = coerceToolArguments(toolDef, call.arguments || {});
+          writeSse(res, "tool_call", { name: call.name, arguments: safeArgs });
+          try {
+            toolResult = await callMcpTool(config, call.name, safeArgs);
+          } catch (error) {
+            toolResult = {
+              content: [{ type: "text", text: `Tool error: ${error.message}` }],
+              isError: true
+            };
+          }
         }
 
         const toolText = mcpResultToText(toolResult);
@@ -924,8 +1020,8 @@ export default async function handler(req, res) {
     writeSse(res, "done", {
       ok: true,
       message: finalText,
-      cart_actions: [],
-      pending: null,
+      cart_actions: finalCartActions,
+      pending: finalPending,
       ...(firstConvo && effectiveCatalog ? { catalogData: effectiveCatalog } : {})
     });
     res.end();
