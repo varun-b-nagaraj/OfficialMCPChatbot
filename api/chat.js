@@ -620,18 +620,49 @@ function localCartToolDefinition() {
   };
 }
 
-function looksLikeAddToCartIntent(text) {
-  const t = String(text || "").toLowerCase();
-  return /\b(add|put|place|throw|toss)\b/.test(t) && /\b(cart|bag)\b/.test(t);
+const ADD_INTENT_RE = /\b(add|put|throw)\b.*\b(cart|bag)\b|\badd\b/i;
+const ORDINAL_WORDS = {
+  first: 0,
+  second: 1,
+  third: 2,
+  fourth: 3,
+  fifth: 4,
+  sixth: 5,
+  seventh: 6,
+  eighth: 7,
+  ninth: 8,
+  tenth: 9
+};
+const CARDINAL_WORDS = {
+  one: 1,
+  two: 2,
+  three: 3,
+  four: 4,
+  five: 5,
+  six: 6,
+  seven: 7,
+  eight: 8,
+  nine: 9,
+  ten: 10
+};
+
+function shouldAddToCart(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+  return ADD_INTENT_RE.test(t) && (t.includes("cart") || t.includes("bag") || t.startsWith("add "));
 }
 
 function parseQuantity(text) {
   const t = String(text || "").toLowerCase();
-  const match = t.match(/\b(\d{1,2})\s*(x|qty|quantity)?\b/);
+  const match = t.match(/\b(\d{1,2})\s*(x|×)?\b/);
   if (!match) return 1;
   const qty = Number(match[1]);
-  if (!Number.isFinite(qty)) return 1;
-  return Math.max(1, Math.min(20, qty));
+  return Number.isFinite(qty) ? Math.max(1, Math.min(20, qty)) : 1;
+}
+
+function wantsMultipleDistinctItems(text) {
+  const t = String(text || "").toLowerCase();
+  return t.includes("both") || t.includes("all") || /\b(last|first|these|those)\s+\d+\b/.test(t);
 }
 
 function productMatchScore(userText, productName) {
@@ -667,6 +698,18 @@ function getOptionNames(product) {
   return names;
 }
 
+function userSpecifiedVariant(userText, variantLabel, variantKey) {
+  const text = String(userText || "").toLowerCase();
+  if (!text) return false;
+  if (variantKey && String(variantKey).toLowerCase() && text.includes(String(variantKey).toLowerCase())) {
+    return true;
+  }
+  const tokens = String(variantLabel || "")
+    .toLowerCase()
+    .match(/[a-z0-9]+/g) || [];
+  return tokens.filter((t) => t.length >= 2).some((tok) => text.includes(tok));
+}
+
 function userSpecifiedOptionType(userText, product) {
   const t = normalizeName(userText);
   if (!t) return false;
@@ -677,42 +720,176 @@ function userSpecifiedOptionType(userText, product) {
   return false;
 }
 
-function ordinalIndex(text) {
+function extractSingleOrdinalIndex(text, total) {
   const t = String(text || "").toLowerCase();
-  if (/\bfirst\b/.test(t)) return 0;
-  if (/\bsecond\b/.test(t)) return 1;
-  if (/\bthird\b/.test(t)) return 2;
-  if (/\bfourth\b/.test(t)) return 3;
-  if (/\blast\b/.test(t)) return -1;
-  const m = t.match(/\b(\d+)\b/);
+  if (!t || total <= 0) return null;
+  if (/\blast\s+one\b|\bthe\s+last\b|\blast\b/.test(t)) return total - 1;
+  for (const [word, idx] of Object.entries(ORDINAL_WORDS)) {
+    if (new RegExp(`\\b${word}\\b`).test(t) && idx < total) return idx;
+  }
+  const m = t.match(/\b(\d{1,2})(?:st|nd|rd|th)?\b/);
   if (m) {
-    const n = Number(m[1]) - 1;
-    if (Number.isFinite(n) && n >= 0) return n;
+    const idx = Number(m[1]) - 1;
+    if (Number.isFinite(idx) && idx >= 0 && idx < total) return idx;
   }
   return null;
 }
 
-function resolvePendingSelection(pending, userText) {
-  if (!pending || pending.type !== "choose_for_cart" || !Array.isArray(pending.options)) return null;
-  if (!pending.options.length) return null;
-  const idx = ordinalIndex(userText);
-  if (idx == null) return null;
-  const chosen = idx === -1 ? pending.options[pending.options.length - 1] : pending.options[idx];
-  return chosen || null;
+function parseMultiIndices(text, totalOptions) {
+  if (!text) return [];
+  const t = text.toLowerCase();
+  if (totalOptions && /\b(all|every|all of them)\b/.test(t)) return [...Array(totalOptions).keys()];
+  if (totalOptions === 2 && /\b(both|both of them|those two|these two)\b/.test(t)) return [0, 1];
+
+  const indices = [];
+  const seen = new Set();
+  const tokenRe = /\b(\d{1,2})(?:st|nd|rd|th)?\b|\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|last|one|two|three|four|five|six|seven|eight|nine|ten)\b/g;
+  let match;
+  while ((match = tokenRe.exec(t)) !== null) {
+    let idx = null;
+    if (match[1]) {
+      idx = Number(match[1]) - 1;
+    } else if (match[2]) {
+      const word = match[2];
+      if (word === "last" && totalOptions) idx = totalOptions - 1;
+      else if (word in ORDINAL_WORDS) idx = ORDINAL_WORDS[word];
+      else if (word in CARDINAL_WORDS) idx = CARDINAL_WORDS[word] - 1;
+    }
+    if (idx == null || Number.isNaN(idx)) continue;
+    if (totalOptions != null && (idx < 0 || idx >= totalOptions)) continue;
+    if (!seen.has(idx)) {
+      seen.add(idx);
+      indices.push(idx);
+    }
+  }
+  return indices;
 }
 
 function buildCartAction(product, quantity) {
   if (!product || !Number.isFinite(Number(product.id))) return null;
+  const pid = Number(product.id);
+  const cidRaw = product.combinationId ?? product.variation ?? product.variantId ?? 0;
+  const cid = Number.isFinite(Number(cidRaw)) ? Number(cidRaw) : 0;
+  const opts = Array.isArray(product.selectedOptions)
+    ? product.selectedOptions
+    : Array.isArray(product.options)
+      ? product.options
+      : [];
   return {
     type: "cart.add",
+    productId: pid,
+    combinationId: cid,
+    quantity,
+    sku: product.sku || null,
+    options: opts,
     product: {
-      id: Number(product.id),
+      id: pid,
       quantity,
       options: {},
       sku: product.sku || null,
       name: product.name || null
     }
   };
+}
+
+function productHasSingleVariant(products, productId) {
+  for (const p of toArray(products)) {
+    if (Number(p?.id || 0) !== Number(productId || 0)) continue;
+    const variants = toArray(p?.variants).filter((v) => v?.variantKey && v?.in_stock !== false);
+    return variants.length === 1;
+  }
+  return false;
+}
+
+function pickCartCandidates(userText, productLinks, products) {
+  if (!productLinks.length) return { candidates: [], reason: null };
+  if (productLinks.length === 1) return { candidates: productLinks, reason: "single" };
+
+  const selectionIndices = parseMultiIndices(userText, productLinks.length);
+  if (selectionIndices.length) {
+    return { candidates: selectionIndices.map((i) => productLinks[i]).filter(Boolean), reason: "index" };
+  }
+
+  const explicit = productLinks.filter((link) =>
+    userSpecifiedVariant(userText, link.variantLabel || "", String(link.variantKey || ""))
+  );
+  if (explicit.length === 1) return { candidates: explicit, reason: "explicit" };
+  if (explicit.length > 1) return { candidates: [], reason: null };
+
+  const lowerText = String(userText || "").toLowerCase();
+  const byName = productLinks.filter((link) => link.name && lowerText.includes(String(link.name).toLowerCase()));
+  if (byName.length === 1) return { candidates: byName, reason: "name" };
+
+  return { candidates: [], reason: null };
+}
+
+function buildCartActions(userText, productLinks, products) {
+  if (!shouldAddToCart(userText)) return [];
+  const { candidates, reason } = pickCartCandidates(userText, productLinks, products);
+  if (!candidates.length) return [];
+  let qty = parseQuantity(userText);
+  if (candidates.length >= 2 && wantsMultipleDistinctItems(userText)) qty = 1;
+  const actions = [];
+
+  for (const candidate of candidates) {
+    const pid = Number(candidate.id || 0);
+    const label = candidate.variantLabel || "";
+    let allowAdd = true;
+    if (reason === "name") {
+      allowAdd = productHasSingleVariant(products, pid) || userSpecifiedVariant(userText, label, String(candidate.variantKey || ""));
+    }
+    if (!allowAdd) continue;
+    const action = buildCartAction(candidate, qty);
+    if (action) actions.push(action);
+  }
+  return actions;
+}
+
+function buildCartActionsFromLinks(productLinks, quantity) {
+  return productLinks
+    .map((link) => buildCartAction(link, quantity))
+    .filter(Boolean);
+}
+
+function enforceSingleOrdinalCartActions(userText, cartActions) {
+  if (cartActions.length <= 1) return cartActions;
+  const idx = extractSingleOrdinalIndex(userText, cartActions.length);
+  if (idx == null) return cartActions;
+  return [cartActions[idx]];
+}
+
+function looksLikeSelectionReply(text) {
+  const t = String(text || "").toLowerCase();
+  return /\b(both|either|all|one|two|three|first|second|third|fourth|fifth|last)\b/.test(t) ||
+    /\b\d{1,2}(?:st|nd|rd|th)?\b/.test(t);
+}
+
+function resolvePendingChoice(userText, pending, products) {
+  if (!pending || pending.type !== "choose_for_cart" || !Array.isArray(pending.options) || !pending.options.length) {
+    return { actions: [], pending: null };
+  }
+  const { candidates } = pickCartCandidates(userText, pending.options, products);
+  if (candidates.length) {
+    let qty = Number(pending.quantity || 1);
+    if (candidates.length >= 2 && wantsMultipleDistinctItems(userText)) qty = 1;
+    return { actions: buildCartActionsFromLinks(candidates, qty), pending: null };
+  }
+
+  const lower = String(userText || "").toLowerCase();
+  const mentionsOption = pending.options.some((option) =>
+    (option.name && lower.includes(String(option.name).toLowerCase())) ||
+    userSpecifiedVariant(lower, option.variantLabel || "", String(option.variantKey || ""))
+  );
+  if (looksLikeSelectionReply(userText) || mentionsOption) {
+    return { actions: [], pending };
+  }
+  return { actions: [], pending: null };
+}
+
+function buildCartConfirmationMessage(cartActions) {
+  if (!cartActions.length) return null;
+  const total = cartActions.reduce((sum, action) => sum + Number(action.quantity || 0), 0) || cartActions.length;
+  return total === 1 ? "Added to your cart." : `Added ${total} items to your cart.`;
 }
 
 function buildPendingFromCandidates(candidates, quantity, reason) {
@@ -732,44 +909,45 @@ function buildPendingFromCandidates(candidates, quantity, reason) {
 }
 
 function resolveCartDecision(userText, catalogProducts, pendingInput) {
-  const quantity = parseQuantity(userText);
-  const pendingChoice = resolvePendingSelection(pendingInput, userText);
-  if (pendingChoice) {
-    const action = buildCartAction(pendingChoice, quantity);
-    if (action) {
-      return {
-        message: `Added ${pendingChoice.name} to your cart.`,
-        cart_actions: [action],
-        pending: null
-      };
-    }
+  const products = toArray(catalogProducts);
+  const { actions: pendingActions, pending: pendingResponse } = resolvePendingChoice(userText, pendingInput, products);
+  if (pendingActions.length) {
+    const finalActions = enforceSingleOrdinalCartActions(userText, pendingActions);
+    return {
+      message: buildCartConfirmationMessage(finalActions) || "Added to your cart.",
+      cart_actions: finalActions,
+      pending: null
+    };
+  }
+  if (pendingResponse) {
+    return {
+      message: "Please choose one of the listed options.",
+      cart_actions: [],
+      pending: pendingResponse
+    };
   }
 
-  const candidates = findCartCandidates(userText, catalogProducts);
-  if (!candidates.length) {
+  const links = findCartCandidates(userText, products);
+  const cartActions = buildCartActions(userText, links, products);
+  const finalCartActions = enforceSingleOrdinalCartActions(userText, cartActions);
+
+  if (finalCartActions.length) {
     return {
-      message: "I could not find that product in the enabled catalog. Tell me the product type or exact name.",
-      cart_actions: [],
+      message: buildCartConfirmationMessage(finalCartActions) || "Added to your cart.",
+      cart_actions: finalCartActions,
       pending: null
     };
   }
 
-  const best = candidates[0];
-  const multiple = candidates.length > 1;
-  const requiresType = getOptionNames(best).length > 0 && !userSpecifiedOptionType(userText, best);
-
-  if (multiple || requiresType || !Number.isFinite(Number(best.id))) {
-    const reason = requiresType
-      ? "Please choose the product type/options before adding to cart."
-      : "Please choose which product you want to add.";
-    const pending = buildPendingFromCandidates(candidates, quantity, reason);
-    const lines = [reason];
+  if (shouldAddToCart(userText) && links.length > 1) {
+    const pending = buildPendingFromCandidates(links, parseQuantity(userText), "Please choose the product type/options before adding to cart.");
+    const lines = [pending.reason];
     for (const option of pending.options.slice(0, 4)) {
       const priceText = Number.isFinite(Number(option.price)) ? ` - $${Number(option.price).toFixed(2)}` : "";
       const optionTypeText = option.optionTypes.length ? ` | types: ${option.optionTypes.join(", ")}` : "";
       lines.push(`${option.index}. ${option.name}${priceText}${optionTypeText}`);
     }
-    lines.push("Reply with the number (for example, 1 or 2).");
+    lines.push("Reply with a number (for example, 1 or 2).");
     return {
       message: lines.join("\n"),
       cart_actions: [],
@@ -777,19 +955,17 @@ function resolveCartDecision(userText, catalogProducts, pendingInput) {
     };
   }
 
-  const action = buildCartAction(best, quantity);
-  if (!action) {
-    const pending = buildPendingFromCandidates([best], quantity, "Please confirm the exact product type.");
+  if (shouldAddToCart(userText)) {
     return {
-      message: "Please confirm the product type before I add it to cart.",
+      message: "Tell me the product type or exact product name to add to cart.",
       cart_actions: [],
-      pending
+      pending: null
     };
   }
 
   return {
-    message: `Added ${best.name} to your cart.`,
-    cart_actions: [action],
+    message: "No add-to-cart intent detected.",
+    cart_actions: [],
     pending: null
   };
 }
@@ -899,7 +1075,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (effectiveCatalog && looksLikeAddToCartIntent(latestUserText)) {
+    if (effectiveCatalog && shouldAddToCart(latestUserText)) {
       const decision = resolveCartDecision(latestUserText, catalogProducts, pendingInput);
       streamTextAsDeltas(res, decision.message, 1);
       writeSse(res, "assistant", { text: decision.message, round: 1 });
