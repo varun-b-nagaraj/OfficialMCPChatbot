@@ -148,3 +148,40 @@ while (true) {
 - Deploy
 
 The endpoint is compatible with Vercel serverless functions and keeps the architecture to one REST API route.
+
+## Python MCP Add-to-Cart Tool
+
+A standalone official Python MCP server is included at:
+- [python_mcp/add_to_cart_server.py](/Users/varunbhadurgattenagaraj/Downloads/OfficialMCPChatbot/python_mcp/add_to_cart_server.py)
+
+This defines a proper MCP tool:
+- `add_to_cart`
+
+Behavior:
+- Resolves add-to-cart intent from user text + catalog products
+- Returns `cart_actions` for frontend execution (`Ecwid.Cart.addProduct(...)`)
+- Returns `pending` when user must pick product/type/options first
+- Does not mutate cart server-side
+
+Install and run:
+
+```bash
+cd /Users/varunbhadurgattenagaraj/Downloads/OfficialMCPChatbot/python_mcp
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python add_to_cart_server.py
+```
+
+Example `mcpServers` entry:
+
+```json
+{
+  "mcpServers": {
+    "ecwid-cart-decision": {
+      "command": "/Users/varunbhadurgattenagaraj/Downloads/OfficialMCPChatbot/python_mcp/.venv/bin/python",
+      "args": ["/Users/varunbhadurgattenagaraj/Downloads/OfficialMCPChatbot/python_mcp/add_to_cart_server.py"]
+    }
+  }
+}
+```
