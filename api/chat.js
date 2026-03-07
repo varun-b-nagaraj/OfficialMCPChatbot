@@ -193,9 +193,36 @@ function coerceToolArguments(tool, rawArgs) {
   const props = schema.properties || {};
   const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   const args = { ...(rawArgs || {}) };
+  const toolName = String(tool?.name || "").toLowerCase();
+
+  function expectedTypeOf(definition) {
+    if (!definition || typeof definition !== "object") return null;
+    if (typeof definition.type === "string") return definition.type;
+    if (Array.isArray(definition.type)) {
+      const first = definition.type.find((t) => typeof t === "string");
+      if (first) return first;
+    }
+    if (Array.isArray(definition.oneOf)) {
+      for (const item of definition.oneOf) {
+        const t = expectedTypeOf(item);
+        if (t) return t;
+      }
+    }
+    if (Array.isArray(definition.anyOf)) {
+      for (const item of definition.anyOf) {
+        const t = expectedTypeOf(item);
+        if (t) return t;
+      }
+    }
+    if (definition.schema && typeof definition.schema === "object") {
+      const t = expectedTypeOf(definition.schema);
+      if (t) return t;
+    }
+    return null;
+  }
 
   for (const [name, definition] of Object.entries(props)) {
-    const expectedType = definition?.type;
+    const expectedType = expectedTypeOf(definition);
     const value = args[name];
 
     if (value == null) {
@@ -229,6 +256,17 @@ function coerceToolArguments(tool, rawArgs) {
       const num = Number(value);
       if (!Number.isNaN(num)) args[name] = num;
     }
+  }
+
+  // Ecwid product search tool expects enabled as string in practice.
+  if (toolName.includes("find_product") && "enabled" in args && typeof args.enabled !== "string") {
+    if (typeof args.enabled === "boolean") args.enabled = args.enabled ? "true" : "false";
+    else args.enabled = String(args.enabled);
+  }
+
+  // Some Ecwid product tools require instructions string.
+  if (toolName.includes("find_product") && (!("instructions" in args) || typeof args.instructions !== "string")) {
+    args.instructions = "Find products from the enabled catalog.";
   }
 
   return args;
