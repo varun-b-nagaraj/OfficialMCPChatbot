@@ -61,6 +61,7 @@ const SALES_SYSTEM_PROMPT = [
   "- Never invent product or order details."
 ].join("\n");
 const LOCAL_CART_TOOL_NAME = "add_to_cart_decision";
+const LOCAL_CART_TOOL_ENABLED = false;
 
 function writeSse(res, event, data) {
   res.write(`event: ${event}\n`);
@@ -1035,7 +1036,9 @@ export default async function handler(req, res) {
       body.allowProductLookup === true ||
       body.allow_product_lookup === true;
     const activeTools = allowProductTool ? mcpTools : mcpTools.filter((tool) => !isProductTool(tool));
-    const ollamaTools = [...toOllamaTools(activeTools), localCartToolDefinition()];
+    const ollamaTools = LOCAL_CART_TOOL_ENABLED
+      ? [...toOllamaTools(activeTools), localCartToolDefinition()]
+      : toOllamaTools(activeTools);
 
     const conversation = [
       { role: "system", content: SALES_SYSTEM_PROMPT },
@@ -1145,7 +1148,7 @@ export default async function handler(req, res) {
       for (const call of toolCalls) {
         let toolResult;
         let safeArgs = call.arguments || {};
-        if (call.name === LOCAL_CART_TOOL_NAME) {
+        if (LOCAL_CART_TOOL_ENABLED && call.name === LOCAL_CART_TOOL_NAME) {
           safeArgs = {
             user_message: safeArgs.user_message || latestUserText,
             catalog_products: Array.isArray(safeArgs.catalog_products) ? safeArgs.catalog_products : catalogProducts,
