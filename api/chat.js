@@ -361,6 +361,10 @@ function normalizeCatalogData(raw) {
   };
 }
 
+function hasUsableCatalog(catalog) {
+  return Boolean(catalog && Array.isArray(catalog.products) && catalog.products.length > 0);
+}
+
 function toOllamaTools(mcpTools) {
   return mcpTools.map((tool) => ({
     type: "function",
@@ -1056,7 +1060,7 @@ export default async function handler(req, res) {
 
     const mcpTools = await listMcpTools(config);
     let effectiveCatalog = providedCatalog;
-    if (firstConvo && !effectiveCatalog) {
+    if (firstConvo && !hasUsableCatalog(effectiveCatalog)) {
       writeSse(res, "catalog_fetch", { status: "started" });
       effectiveCatalog = await preloadCatalogData(config, mcpTools, res);
       writeSse(res, "catalog_fetch", {
@@ -1067,7 +1071,7 @@ export default async function handler(req, res) {
     }
 
     const allowProductTool =
-      !effectiveCatalog ||
+      !hasUsableCatalog(effectiveCatalog) ||
       body.allowProductLookup === true ||
       body.allow_product_lookup === true;
     const activeTools = allowProductTool ? mcpTools : mcpTools.filter((tool) => !isProductTool(tool));
@@ -1129,7 +1133,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (effectiveCatalog && isGeneralRecommendationIntent(latestUserText)) {
+    if (hasUsableCatalog(effectiveCatalog) && isGeneralRecommendationIntent(latestUserText)) {
       const text = formatGeneralRecommendations(catalogProducts);
       streamTextAsDeltas(res, text, 1);
       writeSse(res, "assistant", { text, round: 1 });
@@ -1144,7 +1148,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (effectiveCatalog && shouldAddToCart(latestUserText)) {
+    if (hasUsableCatalog(effectiveCatalog) && shouldAddToCart(latestUserText)) {
       const decision = resolveCartDecision(latestUserText, catalogProducts, pendingInput);
       streamTextAsDeltas(res, decision.message, 1);
       writeSse(res, "assistant", { text: decision.message, round: 1 });
@@ -1159,7 +1163,7 @@ export default async function handler(req, res) {
       return;
     }
 
-    if (effectiveCatalog && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
+    if (hasUsableCatalog(effectiveCatalog) && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
       const deterministic = formatCatalogRecommendation(latestUserText, catalogProducts);
       streamTextAsDeltas(res, deterministic, 1);
       writeSse(res, "assistant", { text: deterministic, round: 1 });
