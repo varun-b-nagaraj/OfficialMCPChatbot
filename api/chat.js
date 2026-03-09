@@ -36,29 +36,26 @@ function applyCors(req, res) {
 }
 
 const SALES_SYSTEM_PROMPT = [
-  "You are an expert ecommerce sales assistant.",
-  "Goals:",
-  "1) Help shoppers quickly find products and move them toward purchase.",
-  "2) Be proactive: when users ask broad requests (for example 'show me products'), immediately provide useful options across relevant categories.",
-  "3) Ask clarifying questions only when truly necessary to complete a task. Keep to at most one short clarifying question.",
-  "4) Recommend strong alternatives and relevant add-ons when helpful.",
-  "5) Use relevant sales context (for example popular products or order history patterns) to guide recommendations and encourage buying decisions.",
-  "6) Treat CATALOG_CONTEXT_JSON as the primary source of truth for products and pricing when present.",
-  "7) Do not call product listing/search tools when CATALOG_CONTEXT_JSON is available unless the user asks to refresh inventory or catalog data is clearly insufficient.",
-  "8) Be honest about what you know; use tools for order/customer lookup and order creation when needed.",
-  "9) When creating an order, confirm critical fields before finalizing.",
-  "10) For cart operations, return structured cart action intent to the client layer and ask for product type/options when selection is ambiguous.",
-  "11) Never claim cart support is unavailable. Cart operations are supported through cart_actions and pending responses.",
+  "You are the RRHS CO-OP shopping assistant.",
+  "Your job is to help students and staff find relevant school store products quickly and naturally.",
+  "Rules:",
+  "1) Answer the user's actual intent first.",
+  "2) Do not recommend products unless the user is asking to browse, compare, buy, or get suggestions.",
+  "3) If the user sends a greeting like 'hi', 'hello', or 'hey', respond with a short greeting and offer help. Do not list products.",
+  "4) If the user asks for general recommendations, provide a short curated list with brief reasons.",
+  "5) For vague shopping questions, prefer a short helpful response over dumping the full catalog.",
+  "6) Use CATALOG_CONTEXT_JSON as the source of truth for product names and pricing.",
+  "7) Do not call product listing/search tools when catalog context is present unless refresh is requested or context is insufficient.",
+  "8) For cart operations, support structured cart intent via cart_actions and pending responses.",
+  "9) Never claim cart support is unavailable.",
+  "10) Be concise, friendly, and natural.",
   "Behavior:",
-  "- Default to action over questions. Do not interrogate the shopper.",
-  "- For generic shopping intents, use available catalog context first and present a curated list immediately.",
-  "- If message history exists, continue naturally from that context without re-asking already answered questions.",
-  "- Keep answers concise, useful, and conversion-focused.",
-  "- Summarize tool findings clearly and propose the next best step.",
-  "- Use friendly sales language and concrete recommendations.",
-  "- Do not reveal internal product counts, stock quantities, internal IDs, private customer data, or operational/sensitive fields.",
-  "- If sensitive/internal data appears in tool output, omit it and provide a safe shopper-facing summary instead.",
-  "- Never invent product or order details."
+  "- Greetings -> greet back and ask what they are looking for.",
+  "- General recommendation questions -> give 3 to 5 strong picks.",
+  "- Specific product questions -> answer directly from catalog context.",
+  "- Add-to-cart requests -> resolve the item and return cart actions.",
+  "- Do not reveal internal product counts, stock quantities, internal IDs, private customer data, or operational fields.",
+  "- Never invent product details."
 ].join("\n");
 const LOCAL_CART_TOOL_NAME = "add_to_cart_decision";
 const LOCAL_CART_TOOL_ENABLED = false;
@@ -477,7 +474,9 @@ function parseMaxPrice(text) {
 function parseCategoryTerms(text) {
   const stop = new Set([
     "show", "me", "some", "products", "product", "find", "list", "recommend", "give", "enabled",
-    "under", "below", "less", "than", "price", "for", "with", "and", "or", "the", "a", "an"
+    "under", "below", "less", "than", "price", "for", "with", "and", "or", "the", "a", "an",
+    "what", "are", "good", "best", "popular", "cool", "nice", "hi", "hello", "hey", "yo",
+    "please", "can", "you", "i", "want", "today", "anything"
   ]);
   return normalizeName(text)
     .split(" ")
@@ -486,7 +485,28 @@ function parseCategoryTerms(text) {
 
 function isShoppingBrowseIntent(text) {
   const t = String(text || "").toLowerCase();
-  return /(show|find|list|recommend|suggest|shop|what.*have|products?)/.test(t);
+  return (
+    /\b(show|find|list|recommend|suggest)\b/.test(t) ||
+    /\bproducts?\b/.test(t) ||
+    /\b(snacks|chips|drinks|apparel|shirts|hoodies|supplies|school supplies|gifts)\b/.test(t)
+  );
+}
+
+function isGreeting(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return /^(hi|hello|hey|yo|sup|good morning|good afternoon|good evening)\b/.test(t);
+}
+
+function isGeneralRecommendationIntent(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    /what are some good products/.test(t) ||
+    /what products do you recommend/.test(t) ||
+    /what should i buy/.test(t) ||
+    /\bbest products\b/.test(t) ||
+    /\bpopular products\b/.test(t) ||
+    /\bgood products\b/.test(t)
+  );
 }
 
 function formatCatalogRecommendation(userText, catalogProducts) {
@@ -525,6 +545,21 @@ function formatCatalogRecommendation(userText, catalogProducts) {
     lines.push(`- ${p.name} - ${priceText}`);
   }
   lines.push("Tell me which one you want and I can help with checkout.");
+  return lines.join("\n");
+}
+
+function formatGeneralRecommendations(catalogProducts) {
+  const picks = catalogProducts.slice(0, 5);
+  if (!picks.length) {
+    return "We have snacks, school supplies, apparel, and accessories. Tell me what category you want and I will narrow it down.";
+  }
+
+  const lines = ["Here are some good RRHS CO-OP picks right now:"];
+  for (const p of picks) {
+    const priceText = p.price == null ? "Price available at checkout" : `$${p.price.toFixed(2)}`;
+    lines.push(`- ${p.name} - ${priceText}`);
+  }
+  lines.push("If you want, I can suggest the best snacks, apparel, or school supplies specifically.");
   return lines.join("\n");
 }
 
@@ -1063,8 +1098,39 @@ export default async function handler(req, res) {
       firstConvo
     });
 
+    if (isGreeting(latestUserText)) {
+      const text =
+        "Hey! I'm the RRHS CO-OP Bot. I can help with snacks, apparel, school supplies, and gifts. What are you looking for today?";
+      streamTextAsDeltas(res, text, 1);
+      writeSse(res, "assistant", { text, round: 1 });
+      writeSse(res, "done", {
+        ok: true,
+        message: text,
+        cart_actions: [],
+        pending: null,
+        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+      });
+      res.end();
+      return;
+    }
+
     if (isToolingQuestion(latestUserText)) {
       const text = toolingSummaryText(activeTools);
+      streamTextAsDeltas(res, text, 1);
+      writeSse(res, "assistant", { text, round: 1 });
+      writeSse(res, "done", {
+        ok: true,
+        message: text,
+        cart_actions: [],
+        pending: null,
+        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
+      });
+      res.end();
+      return;
+    }
+
+    if (effectiveCatalog && isGeneralRecommendationIntent(latestUserText)) {
+      const text = formatGeneralRecommendations(catalogProducts);
       streamTextAsDeltas(res, text, 1);
       writeSse(res, "assistant", { text, round: 1 });
       writeSse(res, "done", {
