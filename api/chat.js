@@ -36,26 +36,30 @@ function applyCors(req, res) {
 }
 
 const SALES_SYSTEM_PROMPT = [
-  "You are the RRHS CO-OP shopping assistant.",
-  "Your job is to help students and staff find relevant school store products quickly and naturally.",
-  "Rules:",
-  "1) Answer the user's actual intent first.",
-  "2) Do not recommend products unless the user is asking to browse, compare, buy, or get suggestions.",
-  "3) If the user sends a greeting like 'hi', 'hello', or 'hey', respond with a short greeting and offer help. Do not list products.",
-  "4) If the user asks for general recommendations, provide a short curated list with brief reasons.",
-  "5) For vague shopping questions, prefer a short helpful response over dumping the full catalog.",
-  "6) Use CATALOG_CONTEXT_JSON as the source of truth for product names and pricing.",
-  "7) Do not call product listing/search tools when catalog context is present unless refresh is requested or context is insufficient.",
-  "8) For cart operations, support structured cart intent via cart_actions and pending responses.",
-  "9) Never claim cart support is unavailable.",
-  "10) Be concise, friendly, and natural.",
-  "Behavior:",
-  "- Greetings -> greet back and ask what they are looking for.",
-  "- General recommendation questions -> give 3 to 5 strong picks.",
-  "- Specific product questions -> answer directly from catalog context.",
-  "- Add-to-cart requests -> resolve the item and return cart actions.",
-  "- Do not reveal internal product counts, stock quantities, internal IDs, private customer data, or operational fields.",
-  "- Never invent product details."
+  "You are the RRHS CO-OP Bot, a smart and natural shopping assistant for the Round Rock High School school store.",
+  "Your job is to help students and staff find products, answer questions, suggest strong options, and guide decisions naturally.",
+  "How to behave:",
+  "- Be conversational and helpful, not robotic.",
+  "- Understand user intent from full context, not just keywords.",
+  "- Use conversation history for follow-ups like 'any more?' or 'what else?'.",
+  "- If a user says something indirect like 'I'm hungry', infer snack/drink intent.",
+  "- For broad requests, recommend a few relevant products rather than dumping large lists.",
+  "- Keep responses concise and natural.",
+  "Catalog rules:",
+  "- Use CATALOG_CONTEXT_JSON as source of truth when available.",
+  "- Never invent products, prices, variants, stock, or details.",
+  "- Never expose internal IDs, raw metadata, or sensitive operational fields.",
+  "- Do not claim cart actions were executed unless confirmed by the client.",
+  "Recommendation rules:",
+  "- Relevance over quantity.",
+  "- For broad requests provide 3 to 5 options max.",
+  "- For category requests, prioritize matching items from context.",
+  "- If user asks for more, continue same category unless topic changes.",
+  "Tool rules:",
+  "- Use MCP tools when needed to get missing data.",
+  "- Prefer existing catalog context to reduce unnecessary tool calls.",
+  "- If you mention tool capabilities, do so accurately.",
+  "Never invent product details."
 ].join("\n");
 const LOCAL_CART_TOOL_NAME = "add_to_cart_decision";
 const LOCAL_CART_TOOL_ENABLED = false;
@@ -1102,85 +1106,10 @@ export default async function handler(req, res) {
       firstConvo
     });
 
-    if (isGreeting(latestUserText)) {
-      const text =
-        "Hey! I'm the RRHS CO-OP Bot. I can help with snacks, apparel, school supplies, and gifts. What are you looking for today?";
-      streamTextAsDeltas(res, text, 1);
-      writeSse(res, "assistant", { text, round: 1 });
-      writeSse(res, "done", {
-        ok: true,
-        message: text,
-        cart_actions: [],
-        pending: null,
-        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-      });
-      res.end();
-      return;
-    }
-
-    if (isToolingQuestion(latestUserText)) {
-      const text = toolingSummaryText(activeTools);
-      streamTextAsDeltas(res, text, 1);
-      writeSse(res, "assistant", { text, round: 1 });
-      writeSse(res, "done", {
-        ok: true,
-        message: text,
-        cart_actions: [],
-        pending: null,
-        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-      });
-      res.end();
-      return;
-    }
-
-    if (hasUsableCatalog(effectiveCatalog) && isGeneralRecommendationIntent(latestUserText)) {
-      const text = formatGeneralRecommendations(catalogProducts);
-      streamTextAsDeltas(res, text, 1);
-      writeSse(res, "assistant", { text, round: 1 });
-      writeSse(res, "done", {
-        ok: true,
-        message: text,
-        cart_actions: [],
-        pending: null,
-        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-      });
-      res.end();
-      return;
-    }
-
-    if (hasUsableCatalog(effectiveCatalog) && shouldAddToCart(latestUserText)) {
-      const decision = resolveCartDecision(latestUserText, catalogProducts, pendingInput);
-      streamTextAsDeltas(res, decision.message, 1);
-      writeSse(res, "assistant", { text: decision.message, round: 1 });
-      writeSse(res, "done", {
-        ok: true,
-        message: decision.message,
-        cart_actions: decision.cart_actions,
-        pending: decision.pending,
-        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-      });
-      res.end();
-      return;
-    }
-
-    if (hasUsableCatalog(effectiveCatalog) && !allowProductTool && isShoppingBrowseIntent(latestUserText)) {
-      const deterministic = formatCatalogRecommendation(latestUserText, catalogProducts);
-      streamTextAsDeltas(res, deterministic, 1);
-      writeSse(res, "assistant", { text: deterministic, round: 1 });
-      writeSse(res, "done", {
-        ok: true,
-        message: deterministic,
-        cart_actions: [],
-        pending: null,
-        ...(firstConvo ? { catalogData: effectiveCatalog } : {})
-      });
-      res.end();
-      return;
-    }
-
     let finalText = "";
     let finalCartActions = [];
     let finalPending = null;
+    let correctionAttempts = 0;
 
     for (let round = 0; round < config.maxToolRounds; round += 1) {
       const modelResponse = await ollamaChatStream({
@@ -1195,8 +1124,23 @@ export default async function handler(req, res) {
       let assistantText = assistantMessage.content || "";
       const toolCalls = normalizeToolCalls(assistantMessage);
 
-      if (effectiveCatalog && !allowProductTool && hasCatalogHallucination(assistantText, catalogProducts)) {
-        assistantText = formatCatalogRecommendation(latestUserText || assistantText, catalogProducts);
+      if (
+        hasUsableCatalog(effectiveCatalog) &&
+        hasCatalogHallucination(assistantText, catalogProducts) &&
+        correctionAttempts < 2
+      ) {
+        correctionAttempts += 1;
+        conversation.push({
+          role: "assistant",
+          content: assistantText,
+          tool_calls: assistantMessage.tool_calls || []
+        });
+        conversation.push({
+          role: "user",
+          content:
+            "Revise your previous response to only mention products that exist in CATALOG_CONTEXT_JSON. Do not invent any products or prices."
+        });
+        continue;
       }
 
       conversation.push({
